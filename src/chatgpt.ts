@@ -52,9 +52,18 @@ export async function ensureSession(): Promise<void> {
     throw new Error('Failed to navigate to ChatGPT');
   }
 
-  await wait(2000);
+  // Wait for page to settle, then check login with retries
+  // (Cloudflare checks or slow loads can cause false negatives)
+  await wait(3000);
 
-  const isLoggedIn = await checkLoginStatus();
+  let isLoggedIn = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    isLoggedIn = await checkLoginStatus();
+    if (isLoggedIn) break;
+    console.error(`[session] Login check attempt ${attempt + 1} failed, retrying...`);
+    await wait(3000);
+  }
+
   sessionState.isLoggedIn = isLoggedIn;
   sessionInitialized = true;
 
@@ -65,6 +74,16 @@ export async function ensureSession(): Promise<void> {
   }
 
   await saveStorageState();
+
+  // Auto-select default project on first launch
+  if (CONFIG.defaultProject && !sessionState.currentProjectUrl) {
+    const result = await selectProject(CONFIG.defaultProject);
+    if (result.success) {
+      console.error(`[session] Auto-selected default project: ${CONFIG.defaultProject}`);
+    } else {
+      console.error(`[session] Default project "${CONFIG.defaultProject}" not found, using home`);
+    }
+  }
 }
 
 /**
@@ -84,149 +103,97 @@ async function checkLoginStatus(): Promise<boolean> {
 
 /**
  * Get the latest assistant response text from the page.
- * Uses 5-strategy extraction with thinking-content filtering.
+ *
+ * ChatGPT DOM as of 2026-02:
+ * - Each message is in [data-testid="conversation-turn-N"]
+ * - Turn 1 = user, Turn 2 = assistant, Turn 3 = user, etc.
+ * - The response text is the innerText of the last turn, minus UI chrome
+ * - .markdown/.prose selectors may or may not exist depending on response type
+ *
+ * Strategy: get the last conversation turn's innerText via the browser's
+ * HTMLElement.innerText (which respects visibility), then clean UI phrases.
  */
 async function getLatestResponseText(): Promise<string | null> {
   try {
     const page = await getPage();
 
     const text = await page.evaluate(() => {
-      // Helper to clean text by removing UI chrome from ChatGPT
+      // UI chrome phrases that appear in turn elements but aren't part of the response
+      const phrasesToRemove = [
+        'ChatGPT said:',
+        'ChatGPT said',
+        'Pro thinking',
+        'Answer now',
+        'Extended thinking',
+        'Show thinking',
+        'Hide thinking',
+        'Reasoning',
+        'Thinking...',
+        'Thinking\u2026',
+        '\u2022 ',
+      ];
+
       const cleanText = (text: string): string => {
         let cleaned = text;
-
-        const phrasesToRemove = [
-          'ChatGPT said:',
-          'ChatGPT said',
-          'Pro thinking',
-          'Answer now',
-          'Extended thinking',
-          'Show thinking',
-          'Hide thinking',
-          'Reasoning',
-          'Thinking...',
-          'Thinking\u2026',
-          'Thinking',
-          '\u2022 ',
-        ];
-
         for (const phrase of phrasesToRemove) {
           while (cleaned.includes(phrase)) {
-            cleaned = cleaned.replace(phrase, ' ');
+            cleaned = cleaned.replace(phrase, '');
           }
         }
-
+        // Remove "Thinking" only as a standalone word at the start
+        cleaned = cleaned.replace(/^Thinking\s*/i, '');
         cleaned = cleaned.replace(/Pro\s+thinking\s*\u2022?\s*/gi, '');
-        cleaned = cleaned.replace(/\d+\s*(seconds?|secs?|s)\s*/gi, '');
+        // Remove timing indicators like "15 seconds" but be careful not to strip legitimate numbers
+        cleaned = cleaned.replace(/^\d+\s*(seconds?|secs?)\s*/i, '');
         cleaned = cleaned.replace(/\s+/g, ' ').trim();
-
         return cleaned;
       };
 
-      // Helper to extract clean text from an element, excluding UI chrome
-      const getText = (el: Element | null): string | null => {
-        if (!el) return null;
+      // Get all conversation turns
+      const turns = document.querySelectorAll('[data-testid^="conversation-turn-"]');
+      if (turns.length < 2) return null;
 
-        const clone = el.cloneNode(true) as Element;
+      const lastTurn = turns[turns.length - 1] as HTMLElement;
 
-        const chromeSelectors = [
-          '[class*="thinking"]',
-          '[class*="reasoning"]',
-          '[data-testid*="thinking"]',
-          'button',
-          '[role="button"]',
-          '[class*="actions"]',
-          '[class*="toolbar"]',
-          '[class*="copy"]',
-          '[aria-label*="Copy"]',
-          '[aria-label*="Regenerate"]',
-          '[aria-label*="Edit"]',
-        ];
-
-        for (const selector of chromeSelectors) {
-          clone.querySelectorAll(selector).forEach(e => e.remove());
-        }
-
-        const markdown = clone.querySelector('.markdown, .prose, [class*="markdown"]');
-        if (markdown) {
-          return cleanText(markdown.textContent?.trim() ?? '');
-        }
-
-        const rawText = clone.textContent?.trim() ?? null;
-        return rawText ? cleanText(rawText) : null;
-      };
-
-      // Helper to check if element is inside a thinking/reasoning container
-      const isInsideThinking = (el: Element): boolean => {
-        let parent: Element | null = el;
-        while (parent) {
-          const classes = parent.className?.toLowerCase() || '';
-          const testId = parent.getAttribute('data-testid')?.toLowerCase() || '';
-          if (classes.includes('thinking') || classes.includes('reasoning') ||
-              testId.includes('thinking') || testId.includes('reasoning')) {
-            return true;
-          }
-          parent = parent.parentElement;
-        }
-        return false;
-      };
-
-      // Strategy 1: Markdown/prose content NOT inside thinking containers
-      const main = document.querySelector('main');
-      if (main) {
-        const markdowns = main.querySelectorAll('.markdown, .prose, [class*="markdown"]');
-        const nonThinkingMarkdowns = Array.from(markdowns).filter(m => !isInsideThinking(m));
-        if (nonThinkingMarkdowns.length > 0) {
-          const lastMarkdown = nonThinkingMarkdowns[nonThinkingMarkdowns.length - 1];
-          const text = lastMarkdown.textContent?.trim();
-          if (text) return cleanText(text);
-        }
-        if (markdowns.length > 0) {
-          const lastMarkdown = markdowns[markdowns.length - 1];
-          const text = lastMarkdown.textContent?.trim();
-          if (text) return cleanText(text);
-        }
+      // Strategy 1: Use innerText of the turn element (respects visibility, skips hidden elements)
+      // This is the most reliable because it gets exactly what the user sees
+      const innerText = lastTurn.innerText?.trim();
+      if (innerText) {
+        const cleaned = cleanText(innerText);
+        if (cleaned.length > 0) return cleaned;
       }
 
-      // Strategy 2: data-message-author-role="assistant"
-      const assistantMessages = document.querySelectorAll('[data-message-author-role="assistant"]');
-      if (assistantMessages.length > 0) {
-        const lastMsg = assistantMessages[assistantMessages.length - 1];
-        const text = getText(lastMsg);
-        if (text) return text;
-      }
-
-      // Strategy 3: Article elements (ChatGPT uses articles for turns)
-      const articles = document.querySelectorAll('article');
-      if (articles.length > 0) {
-        const lastArticle = articles[articles.length - 1];
-        const text = getText(lastArticle);
-        if (text) return text;
-      }
-
-      // Strategy 4: Conversation turn containers
-      const turnSelectors = [
-        '[data-testid*="conversation-turn"]',
-        '[class*="conversation-turn"]',
-        '.agent-turn',
-        '[class*="agent-turn"]',
+      // Strategy 2: Clone, strip chrome elements, get textContent
+      const clone = lastTurn.cloneNode(true) as Element;
+      const chromeSelectors = [
+        'button', '[role="button"]',
+        '[class*="actions"]', '[class*="toolbar"]',
+        'nav', 'header', 'footer',
+        '[class*="thinking"]', '[class*="reasoning"]',
+        '[data-testid*="thinking"]',
       ];
-
-      for (const selector of turnSelectors) {
-        const turns = document.querySelectorAll(selector);
-        if (turns.length > 0) {
-          const lastTurn = turns[turns.length - 1];
-          const text = getText(lastTurn);
-          if (text) return text;
-        }
+      for (const sel of chromeSelectors) {
+        clone.querySelectorAll(sel).forEach(e => e.remove());
+      }
+      const stripped = clone.textContent?.trim();
+      if (stripped) {
+        const cleaned = cleanText(stripped);
+        if (cleaned.length > 0) return cleaned;
       }
 
-      // Strategy 5: Last resort — response/message containers
-      const responseContainers = document.querySelectorAll('[class*="response"], [class*="message"]');
-      if (responseContainers.length > 0) {
-        const last = responseContainers[responseContainers.length - 1];
-        const text = getText(last);
-        if (text) return text;
+      // Strategy 3: Look for markdown/prose inside the turn
+      const markdown = lastTurn.querySelector('.markdown, .prose, [class*="markdown"]');
+      if (markdown) {
+        const mdText = markdown.textContent?.trim();
+        if (mdText) return cleanText(mdText);
+      }
+
+      // Strategy 4: data-message-author-role="assistant" anywhere on page
+      const assistantMsgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+      if (assistantMsgs.length > 0) {
+        const lastMsg = assistantMsgs[assistantMsgs.length - 1] as HTMLElement;
+        const msgText = lastMsg.innerText?.trim();
+        if (msgText) return cleanText(msgText);
       }
 
       return null;
@@ -244,8 +211,16 @@ async function getLatestResponseText(): Promise<string | null> {
 // ============================================
 
 /**
- * Check if generation is complete using multi-indicator + content stability.
- * Returns high-confidence boolean.
+ * Check if generation is complete.
+ *
+ * ChatGPT DOM learnings (2026-02):
+ * - data-testid="stop-button" persists permanently — UNRELIABLE
+ * - data-testid="copy-turn-action-button" inside last turn = response done — RELIABLE
+ * - [class*="streaming"] matches unrelated elements — UNRELIABLE
+ * - data-is-streaming rarely set — UNRELIABLE
+ *
+ * Strategy: check if the LAST conversation turn has a copy button inside it,
+ * combined with content stability.
  */
 async function isGenerationComplete(
   lastContentLength: number,
@@ -254,38 +229,35 @@ async function isGenerationComplete(
   const page = await getPage();
 
   const indicators = await page.evaluate(() => {
-    const stopBtn = document.querySelector('[data-testid="stop-button"]') ||
-                    document.querySelector('button[aria-label*="Stop"]') ||
-                    document.querySelector('button[aria-label*="stop"]');
+    const turns = document.querySelectorAll('[data-testid^="conversation-turn-"]');
+    const turnCount = turns.length;
 
-    const regenBtn = document.querySelector('button[aria-label*="Regenerate"]') ||
-                     document.querySelector('button[aria-label*="Retry"]') ||
-                     document.querySelector('[data-testid="regenerate-button"]');
+    // Check if the LAST turn has a copy button inside it
+    // This is the key signal — copy button appears only when that turn is complete
+    let lastTurnHasCopy = false;
+    // Check if the turn appears to be in a thinking state
+    let isThinking = false;
+    if (turns.length >= 2) {
+      const lastTurn = turns[turns.length - 1];
+      lastTurnHasCopy = !!lastTurn.querySelector('[data-testid="copy-turn-action-button"]');
 
-    const copyBtns = document.querySelectorAll('button[aria-label*="Copy"]');
+      // Detect thinking state: look for thinking indicators in the turn
+      const turnText = (lastTurn as HTMLElement).innerText || '';
+      const thinkingPatterns = /\b(thinking|reasoning)\b/i;
+      const hasThinkingUI = !!lastTurn.querySelector(
+        '[class*="thinking"], [class*="reasoning"], [data-testid*="thinking"]'
+      );
+      // "Thinking" as a standalone label at the start of the turn content
+      isThinking = hasThinkingUI || (thinkingPatterns.test(turnText) && turnText.length < 200);
+    }
 
-    const sendBtn = document.querySelector('[data-testid="send-button"]') ||
-                    document.querySelector('button[data-testid="composer-send-button"]');
-    const sendEnabled = sendBtn && !sendBtn.hasAttribute('disabled');
-
-    const isStreaming = document.querySelector('[data-is-streaming="true"]') !== null;
-
-    return {
-      hasStopButton: !!stopBtn,
-      hasRegenButton: !!regenBtn,
-      hasCopyButton: copyBtns.length > 0,
-      sendEnabled: !!sendEnabled,
-      isStreaming,
-    };
+    return { turnCount, lastTurnHasCopy, isThinking };
   });
 
   const currentText = await getLatestResponseText();
   const currentLength = currentText?.length ?? 0;
 
-  // Still actively generating
-  if (indicators.hasStopButton || indicators.isStreaming) {
-    return { complete: false, contentLength: currentLength, newStableCount: 0 };
-  }
+  console.error(`[poll] turns=${indicators.turnCount} lastTurnCopy=${indicators.lastTurnHasCopy} thinking=${indicators.isThinking} contentLen=${currentLength} stable=${stableCount}`);
 
   // Check content stability
   let newStableCount = stableCount;
@@ -295,13 +267,20 @@ async function isGenerationComplete(
     newStableCount = 0;
   }
 
-  const hasCompletionButton = indicators.hasRegenButton || indicators.hasCopyButton;
-
-  // High confidence: stop absent AND send enabled AND (completion button OR content stable)
+  // Complete if:
+  // 1. Last turn has copy button AND we have content AND it's been stable for 1 check
+  //    (copy button is the authoritative signal — it only appears when generation is truly done)
+  // 2. Fallback: content stable for 10+ checks (~3+ minutes) AND not in thinking state
+  //    (very conservative — only for edge cases where copy button never appears)
+  //
+  // BUG FIX: Previously stableThreshold=3 caused false positives during GPT-5.2 Pro's
+  // thinking phase, where a thinking summary label would appear stable and trigger completion.
+  const FALLBACK_STABLE_THRESHOLD = 10;
   const highConfidence =
-    !indicators.hasStopButton &&
-    indicators.sendEnabled &&
-    (hasCompletionButton || newStableCount >= CONFIG.stableThreshold);
+    (indicators.lastTurnHasCopy && currentLength > 0 && newStableCount >= 1) ||
+    (!indicators.isThinking && currentLength > 0 && newStableCount >= FALLBACK_STABLE_THRESHOLD);
+
+  console.error(`[poll] → complete=${highConfidence}`);
 
   return {
     complete: highConfidence,
@@ -371,6 +350,8 @@ async function pollUntilComplete(
     if (result.complete) {
       const response = await getLatestResponseText();
       const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+      // Save cookies after successful response
+      await saveStorageState();
       return {
         response: response ?? '',
         pollCount,
@@ -649,6 +630,7 @@ export async function newConversation(): Promise<SimpleResult> {
   try {
     await ensureSession();
 
+    // Stay in current project, or navigate to default project URL if set
     const targetUrl = sessionState.currentProjectUrl || CONFIG.chatgptUrl;
     await navigateTo(targetUrl);
     await wait(1500);

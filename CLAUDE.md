@@ -27,8 +27,9 @@ node dist/index.js  # starts MCP server on stdio
 
 ## How it works
 
-1. **Auto-start**: First tool call launches Chromium, navigates to chatgpt.com, checks login status
-2. **Cookies**: Stored at `~/.chatgpt-mcp/user-data/state.json` for persistent sessions
+1. **Auto-start**: First tool call launches Chromium via `launchPersistentContext()`, navigates to chatgpt.com, checks login (with retries), then auto-selects the default project
+2. **Persistent profile**: Full browser profile stored at `~/.chatgpt-mcp/user-data/` (cookies, localStorage, IndexedDB, fingerprint). Login persists across MCP server restarts.
+3. **Default project**: All new chats go to the "claude" project in ChatGPT (configured in `CONFIG.defaultProject` in `types.ts`). This keeps orchestrator conversations organized.
 3. **Sending**: Types into `#prompt-textarea`, clicks send button (multi-selector fallback)
 4. **Polling**: Fibonacci backoff checks DOM indicators + content stability until high-confidence complete
 5. **Extraction**: 5-strategy cascade to find response text, filtering out thinking/reasoning UI chrome
@@ -37,7 +38,7 @@ node dist/index.js  # starts MCP server on stdio
 
 - **Response extraction** (`chatgpt.ts:getLatestResponseText`): The most complex and valuable function. Uses 5 strategies in cascade because ChatGPT's DOM changes frequently. Filters out thinking/reasoning containers and UI chrome. If ChatGPT's UI changes break response reading, this is where to fix it.
 
-- **Completion detection** (`chatgpt.ts:isGenerationComplete`): Multi-indicator approach — checks stop button, streaming attribute, regen/copy buttons, send-enabled state, and content stability (3 consecutive checks with same length). High confidence = stop absent AND send enabled AND (completion button OR content stable).
+- **Completion detection** (`chatgpt.ts:isGenerationComplete`): Checks if the LAST conversation turn has `copy-turn-action-button` inside it (key signal — this only appears when a turn is complete), combined with content stability (3 consecutive checks with same length). Note: `stop-button` persists permanently in the DOM and is NOT reliable for completion detection.
 
 - **Model selection** (`chatgpt.ts:selectModel`): Clicks model selector button, discovers dropdown container via multiple strategies (radix poppers, role=menu, positioned overlays), scans for options matching mode patterns, then matches by exact → startsWith → contains.
 

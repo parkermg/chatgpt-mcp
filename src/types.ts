@@ -117,4 +117,7 @@ export const CONFIG = {
   pollInterval: 5000,
   stableThreshold: 3, // More conservative than gpt-bridge's 2
   maxWaitTime: 3600000,
+  // Default project — all new chats go here unless overridden.
+  // This is the ChatGPT project name as shown in the sidebar.
+  defaultProject: 'claude',
 } as const;

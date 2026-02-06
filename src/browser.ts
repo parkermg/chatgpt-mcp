@@ -1,11 +1,10 @@
 // Browser management for chatgpt-mcp
 
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
+import { chromium, BrowserContext, Page } from 'playwright';
 import { CONFIG } from './types.js';
 import { mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 
-let browser: Browser | null = null;
 let context: BrowserContext | null = null;
 let page: Page | null = null;
 
@@ -16,7 +15,14 @@ async function ensureUserDataDir(): Promise<void> {
 }
 
 /**
- * Launch browser with persistent context for session cookies
+ * Launch browser with a persistent user data directory.
+ *
+ * Uses launchPersistentContext() which maintains the full browser profile
+ * on disk (cookies, localStorage, IndexedDB, browser fingerprint).
+ * This means:
+ * - Login persists across MCP server restarts
+ * - Cloudflare bot detection is less likely (consistent fingerprint)
+ * - No separate storageState save/load needed
  */
 export async function launchBrowser(): Promise<Page> {
   if (page && !page.isClosed()) {
@@ -25,43 +31,29 @@ export async function launchBrowser(): Promise<Page> {
 
   await ensureUserDataDir();
 
-  browser = await chromium.launch({
+  context = await chromium.launchPersistentContext(CONFIG.userDataDir, {
     headless: false,
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
     ],
-  });
-
-  context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     viewport: { width: 1280, height: 800 },
-    storageState: existsSync(`${CONFIG.userDataDir}/state.json`)
-      ? `${CONFIG.userDataDir}/state.json`
-      : undefined,
   });
 
-  page = await context.newPage();
-
-  page.on('close', async () => {
-    await saveStorageState();
-  });
+  // Use the first page if one already exists, otherwise create one
+  const pages = context.pages();
+  page = pages.length > 0 ? pages[0] : await context.newPage();
 
   return page;
 }
 
 /**
- * Save browser storage state (cookies, localStorage) for persistence
+ * Save browser storage state — with persistent context this is mostly a no-op
+ * since the profile is on disk, but we call it for extra safety.
  */
 export async function saveStorageState(): Promise<void> {
-  if (context) {
-    try {
-      await ensureUserDataDir();
-      await context.storageState({ path: `${CONFIG.userDataDir}/state.json` });
-    } catch (error) {
-      console.error('Failed to save storage state:', error);
-    }
-  }
+  // Persistent context auto-saves to userDataDir, nothing to do
 }
 
 /**
@@ -82,24 +74,15 @@ export function isBrowserRunning(): boolean {
 }
 
 /**
- * Close the browser and save state
+ * Close the browser
  */
 export async function closeBrowser(): Promise<void> {
-  await saveStorageState();
-
-  if (page && !page.isClosed()) {
-    await page.close();
-  }
   if (context) {
     await context.close();
-  }
-  if (browser) {
-    await browser.close();
   }
 
   page = null;
   context = null;
-  browser = null;
 }
 
 /**
