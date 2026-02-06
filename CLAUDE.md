@@ -9,7 +9,7 @@ An MCP (Model Context Protocol) server that automates ChatGPT's web UI via Playw
 ```
 src/
 ├── index.ts        # MCP server entry point — registers 5 tools, handles shutdown
-├── browser.ts      # Playwright session management — launch, navigate, find elements, persist cookies
+├── browser.ts      # Playwright persistent context — launchPersistentContext, navigate, find elements
 ├── chatgpt.ts      # Core logic — ensureSession, blockingAsk, blockingReply, uploadFiles,
 │                   #   selectModel, selectProject, newConversation, getLatestResponseText,
 │                   #   isGenerationComplete, pollUntilComplete
@@ -25,24 +25,37 @@ npm run build    # tsc → dist/
 node dist/index.js  # starts MCP server on stdio
 ```
 
+Configured in `~/.claude.json` under `mcpServers.chatgpt`.
+
 ## How it works
 
-1. **Auto-start**: First tool call launches Chromium via `launchPersistentContext()`, navigates to chatgpt.com, checks login (with retries), then auto-selects the default project
-2. **Persistent profile**: Full browser profile stored at `~/.chatgpt-mcp/user-data/` (cookies, localStorage, IndexedDB, fingerprint). Login persists across MCP server restarts.
-3. **Default project**: All new chats go to the "claude" project in ChatGPT (configured in `CONFIG.defaultProject` in `types.ts`). This keeps orchestrator conversations organized.
-3. **Sending**: Types into `#prompt-textarea`, clicks send button (multi-selector fallback)
-4. **Polling**: Fibonacci backoff checks DOM indicators + content stability until high-confidence complete
-5. **Extraction**: 5-strategy cascade to find response text, filtering out thinking/reasoning UI chrome
+1. **Auto-start**: First tool call launches Chromium via `launchPersistentContext()`, navigates to chatgpt.com, checks login (with 3 retries at 3s intervals), then auto-selects the default project
+2. **Persistent profile**: Full browser profile stored at `~/.chatgpt-mcp/user-data/` (cookies, localStorage, IndexedDB, fingerprint). Login persists across MCP server restarts. No separate storageState save/load needed.
+3. **Default project**: All new chats go to the "claude" project in ChatGPT (configured in `CONFIG.defaultProject` in `types.ts`). This keeps orchestrator conversations organized and separate from manual ChatGPT use.
+4. **Sending**: Types into `#prompt-textarea`, clicks send button (with Enter key fallback)
+5. **Polling**: Fibonacci backoff (2,3,5,8,13,21,30s) checks DOM indicators + content stability
+6. **Extraction**: 4-strategy cascade using `innerText` on last conversation turn, cleaning UI chrome phrases
 
 ## Critical code sections
 
-- **Response extraction** (`chatgpt.ts:getLatestResponseText`): The most complex and valuable function. Uses 5 strategies in cascade because ChatGPT's DOM changes frequently. Filters out thinking/reasoning containers and UI chrome. If ChatGPT's UI changes break response reading, this is where to fix it.
+- **Response extraction** (`chatgpt.ts:getLatestResponseText`): Uses `HTMLElement.innerText` on the last `[data-testid^="conversation-turn-"]` element (which respects CSS visibility). Cleans UI chrome phrases like "ChatGPT said:", "Pro thinking", timing indicators, etc. Falls back to clone-strip-textContent, markdown/prose selectors, and `data-message-author-role="assistant"`.
 
-- **Completion detection** (`chatgpt.ts:isGenerationComplete`): Checks if the LAST conversation turn has `copy-turn-action-button` inside it (key signal — this only appears when a turn is complete), combined with content stability (3 consecutive checks with same length). Note: `stop-button` persists permanently in the DOM and is NOT reliable for completion detection.
+- **Completion detection** (`chatgpt.ts:isGenerationComplete`): Primary signal is `copy-turn-action-button` inside the LAST conversation turn — this only appears when that turn's generation is truly complete. Fallback is content stability for 10+ consecutive checks (~3+ minutes) AND not in thinking state. **Important bugs fixed:**
+  - `stop-button` persists permanently in the DOM — DO NOT use for completion detection
+  - `[class*="streaming"]` matches unrelated elements — DO NOT use
+  - Content stability alone at low thresholds causes false positives during GPT-5.2 Pro's thinking phase (thinking summary text appears stable before the actual response)
 
 - **Model selection** (`chatgpt.ts:selectModel`): Clicks model selector button, discovers dropdown container via multiple strategies (radix poppers, role=menu, positioned overlays), scans for options matching mode patterns, then matches by exact → startsWith → contains.
 
 - **DOM selectors** (`types.ts:SELECTORS`): Arrays of fallback selectors for each UI element. When ChatGPT's HTML changes, update these first.
+
+## Known behaviors and gotchas
+
+- **GPT-5.2 Pro thinking time**: Responses typically take 30-140+ seconds due to extended thinking. The Fibonacci backoff means most of this is waiting, not polling overhead.
+- **Cloudflare bot detection**: Using `launchPersistentContext()` with a stable user agent and `--disable-blink-features=AutomationControlled` minimizes this. Avoid spawning multiple browser instances.
+- **Login false negatives**: The login check retries 3 times because Cloudflare challenges or slow page loads can cause the first check to fail before the page is fully rendered.
+- **One browser window**: The MCP server reuses a single persistent browser context. Never spawn additional windows for testing — it triggers Cloudflare and fragments state.
+- **MCP server restarts**: After `npm run build`, the MCP server must be restarted (restart Claude Code) to pick up changes. The browser state persists across restarts via the user data directory.
 
 ## Ancestry
 
@@ -54,14 +67,16 @@ Both predecessors are superseded by this project.
 
 ## Common maintenance tasks
 
-- **ChatGPT UI changed and responses aren't extracted**: Update `SELECTORS` in `types.ts` and/or the 5-strategy cascade in `getLatestResponseText`
-- **New model/mode added**: `selectModel` auto-discovers options dynamically, should work without changes
-- **Want to add a new tool**: Add to `index.ts` using the `server.registerTool()` pattern with Zod schema, implement in `chatgpt.ts`
-- **Timeout issues**: Adjust `CONFIG.stableThreshold` (currently 3) or default `timeoutMinutes` (currently 60)
+- **ChatGPT UI changed and responses aren't extracted**: Update selectors in `getLatestResponseText` and/or `SELECTORS` in `types.ts`. The `innerText` approach is resilient to most layout changes but `conversation-turn-*` testids are critical.
+- **Completion detection broken**: Check if `copy-turn-action-button` still appears after generation. If ChatGPT changes this testid, update `isGenerationComplete`. The fallback (10 stable checks) will still work but is very slow.
+- **New model/mode added**: `selectModel` auto-discovers options dynamically, should work without changes.
+- **Want to add a new tool**: Add to `index.ts` using the `server.registerTool()` pattern with Zod schema, implement in `chatgpt.ts`.
+- **Timeout issues**: Adjust `FALLBACK_STABLE_THRESHOLD` in `isGenerationComplete` (currently 10) or default `timeoutMinutes` (currently 60).
+- **Reset browser state**: Delete `~/.chatgpt-mcp/user-data/` and restart. You'll need to log in again.
 
 ## Tech stack
 
 - TypeScript (ES2022, Node16 modules, strict)
-- Playwright (Chromium, headed mode)
+- Playwright (Chromium, headed mode, persistent context)
 - MCP SDK (`@modelcontextprotocol/sdk`)
 - Zod (input validation)
