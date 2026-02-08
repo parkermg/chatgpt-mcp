@@ -783,17 +783,20 @@ export async function uploadFiles(
     await ensureSession();
     const page = await getPage();
 
-    // Click attach button
-    const attachClicked = await clickElement(SELECTORS.attachButton);
-    if (!attachClicked) {
-      throw new Error('Failed to find attach/upload button.');
+    // Upload files by setting them directly on the hidden <input type="file"> element.
+    // This is more reliable than clicking the attach button (whose selector changes frequently)
+    // and avoids dangerous fallback searches that could click wrong elements.
+    const fileInputSet = await page.evaluate(() => {
+      const inputs = document.querySelectorAll('input[type="file"]');
+      return inputs.length;
+    });
+
+    if (fileInputSet === 0) {
+      throw new Error('No file input found on page. ChatGPT may not support file upload in this state.');
     }
 
-    // Wait for file chooser and set files
-    const [fileChooser] = await Promise.all([
-      page.waitForEvent('filechooser', { timeout: 10000 }),
-    ]);
-    await fileChooser.setFiles(filePaths);
+    // Use Playwright's setInputFiles on the first file input
+    await page.setInputFiles('input[type="file"]', filePaths);
 
     // Wait for upload indicators to appear and settle
     await wait(3000);

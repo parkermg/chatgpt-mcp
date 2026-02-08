@@ -98,6 +98,7 @@ export const SELECTORS = {
 
   // Attach/upload button
   attachButton: [
+    '[data-testid="composer-action-file-upload"]',
     '[data-testid="composer-attach-button"]',
     'button[aria-label*="Attach"]',
     'button[aria-label*="Upload"]',

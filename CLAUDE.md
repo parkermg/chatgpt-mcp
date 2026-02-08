@@ -51,7 +51,7 @@ Configured in `~/.claude.json` under `mcpServers.chatgpt`.
 
 ## Known behaviors and gotchas
 
-- **GPT-5.2 Pro thinking time**: Responses typically take 30-140+ seconds due to extended thinking. The Fibonacci backoff means most of this is waiting, not polling overhead.
+- **GPT-5.2 Pro thinking time**: Simple prompts take 30-140s. Web search prompts can take 10-16+ minutes (~950s observed). Always use `timeout_minutes: 30` for web search queries.
 - **Cloudflare bot detection**: Using `launchPersistentContext()` with a stable user agent and `--disable-blink-features=AutomationControlled` minimizes this. Avoid spawning multiple browser instances.
 - **Login false negatives**: The login check retries 3 times because Cloudflare challenges or slow page loads can cause the first check to fail before the page is fully rendered.
 - **One browser window**: The MCP server reuses a single persistent browser context. Never spawn additional windows for testing — it triggers Cloudflare and fragments state.
